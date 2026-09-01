@@ -2,19 +2,21 @@ import os
 import numpy as np
 import faiss
 import gradio as gr
-
+import streamlit as st
 from groq import Groq
-from getpass import getpass
 from pypdf import PdfReader
 from docx import Document
 from sentence_transformers import SentenceTransformer
+
+# Replace this line further down in your file:
+# GROQ_API_KEY = getpass("Enter your NEW Groq API key: ")
+# with:
+GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
 
 
 # ============================================================
 # GROQ
 # ============================================================
-
-GROQ_API_KEY = getpass("Enter your NEW Groq API key: ")
 
 client = Groq(
     api_key=GROQ_API_KEY
