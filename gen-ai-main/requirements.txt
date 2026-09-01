@@ -1,9 +1,7 @@
-os
-numpy 
-faiss
-gradio 
-Groq
-getpass
-PdfReader
-Document
-SentenceTransformer
+numpy
+faiss-cpu
+gradio
+groq
+pypdf
+python-docx
+sentence-transformers
