@@ -5,3 +5,4 @@ groq
 pypdf
 python-docx
 sentence-transformers
+torchvision
