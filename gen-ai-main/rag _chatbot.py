@@ -1,129 +1,91 @@
 import os
 import numpy as np
 import faiss
-import gradio as gr
 import streamlit as st
 from groq import Groq
 from pypdf import PdfReader
 from docx import Document
 from sentence_transformers import SentenceTransformer
 
-# Replace this line further down in your file:
-# GROQ_API_KEY = getpass("Enter your NEW Groq API key: ")
-# with:
+# ============================================================
+# CONFIG / SECRETS
+# ============================================================
+
 GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
 
-
-# ============================================================
-# GROQ
-# ============================================================
-
-client = Groq(
-    api_key=GROQ_API_KEY
-)
+client = Groq(api_key=GROQ_API_KEY)
 
 MODEL = "openai/gpt-oss-20b"
 
-
-# ============================================================
-# EMBEDDING MODEL
-# ============================================================
-
-print("Loading embedding model...")
-
-embedding_model = SentenceTransformer(
-    "all-MiniLM-L6-v2"
-)
-
-print("Embedding model loaded.")
+st.set_page_config(page_title="MyAI RAG", page_icon="🧠", layout="wide")
 
 
 # ============================================================
-# STORAGE
+# EMBEDDING MODEL (cached so it only loads once per session)
 # ============================================================
 
-documents = []
+@st.cache_resource
+def load_embedding_model():
+    return SentenceTransformer("all-MiniLM-L6-v2")
 
-chunks = []
-
-vector_database = None
+embedding_model = load_embedding_model()
 
 
 # ============================================================
-# READ PDF
+# SESSION STATE (replaces Gradio's global variables)
 # ============================================================
 
-def read_pdf(path):
+if "documents" not in st.session_state:
+    st.session_state.documents = []
 
+if "chunks" not in st.session_state:
+    st.session_state.chunks = []
+
+if "vector_database" not in st.session_state:
+    st.session_state.vector_database = None
+
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []  # list of {"role": ..., "content": ...}
+
+
+# ============================================================
+# READ PDF / DOCX / TXT
+# (Streamlit's uploaded files are file-like objects already,
+#  so we read from them directly instead of a filesystem path)
+# ============================================================
+
+def read_pdf(file):
     text = ""
-
-    reader = PdfReader(path)
-
+    reader = PdfReader(file)
     for page in reader.pages:
-
         page_text = page.extract_text()
-
         if page_text:
             text += page_text + "\n"
-
     return text
 
 
-# ============================================================
-# READ DOCX
-# ============================================================
-
-def read_docx(path):
-
-    doc = Document(path)
-
+def read_docx(file):
+    doc = Document(file)
     text = ""
-
     for paragraph in doc.paragraphs:
-
         text += paragraph.text + "\n"
-
     return text
 
 
-# ============================================================
-# READ TXT
-# ============================================================
-
-def read_txt(path):
-
-    with open(
-        path,
-        "r",
-        encoding="utf-8",
-        errors="ignore"
-    ) as file:
-
-        return file.read()
+def read_txt(file):
+    return file.read().decode("utf-8", errors="ignore")
 
 
-# ============================================================
-# DOCUMENT READER
-# ============================================================
-
-def read_document(path):
-
-    extension = os.path.splitext(path)[1].lower()
+def read_document(uploaded_file):
+    extension = os.path.splitext(uploaded_file.name)[1].lower()
 
     if extension == ".pdf":
-
-        return read_pdf(path)
-
+        return read_pdf(uploaded_file)
     elif extension == ".docx":
-
-        return read_docx(path)
-
+        return read_docx(uploaded_file)
     elif extension == ".txt":
-
-        return read_txt(path)
-
+        return read_txt(uploaded_file)
     else:
-
         return ""
 
 
@@ -131,37 +93,17 @@ def read_document(path):
 # CHUNKING
 # ============================================================
 
-def create_chunks(
-    text,
-    chunk_size=700,
-    overlap=100
-):
-
-    text = text.replace(
-        "\n",
-        " "
-    )
-
-    text = " ".join(
-        text.split()
-    )
+def create_chunks(text, chunk_size=700, overlap=100):
+    text = text.replace("\n", " ")
+    text = " ".join(text.split())
 
     result = []
-
     start = 0
-
     while start < len(text):
-
         end = start + chunk_size
-
         chunk = text[start:end]
-
         if chunk.strip():
-
-            result.append(
-                chunk.strip()
-            )
-
+            result.append(chunk.strip())
         start += chunk_size - overlap
 
     return result
@@ -171,102 +113,52 @@ def create_chunks(
 # BUILD VECTOR DATABASE
 # ============================================================
 
-def build_database(files):
-
-    global documents
-    global chunks
-    global vector_database
-
-    if not files:
-
+def build_database(uploaded_files):
+    if not uploaded_files:
         return "❌ Please upload at least one document."
 
-
     documents = []
-
     chunks = []
 
-
-    # --------------------------------------------------------
-    # READ FILES
-    # --------------------------------------------------------
-
-    for file in files:
-
-        path = file.name
-
-        text = read_document(path)
+    for uploaded_file in uploaded_files:
+        text = read_document(uploaded_file)
 
         if not text.strip():
-
             continue
 
-
-        file_chunks = create_chunks(
-            text
-        )
-
+        file_chunks = create_chunks(text)
 
         for chunk in file_chunks:
-
             chunks.append({
                 "text": chunk,
-                "source": os.path.basename(path)
+                "source": uploaded_file.name
             })
 
-
-        documents.append(
-            os.path.basename(path)
-        )
-
+        documents.append(uploaded_file.name)
 
     if not chunks:
-
         return "❌ Could not extract text from the uploaded files."
 
-
-    # --------------------------------------------------------
-    # CREATE EMBEDDINGS
-    # --------------------------------------------------------
-
-    texts = [
-        item["text"]
-        for item in chunks
-    ]
-
+    texts = [item["text"] for item in chunks]
 
     embeddings = embedding_model.encode(
         texts,
         convert_to_numpy=True,
         normalize_embeddings=True
-    )
-
-
-    embeddings = embeddings.astype(
-        "float32"
-    )
-
-
-    # --------------------------------------------------------
-    # FAISS
-    # --------------------------------------------------------
+    ).astype("float32")
 
     dimension = embeddings.shape[1]
+    vector_database = faiss.IndexFlatIP(dimension)
+    vector_database.add(embeddings)
 
-
-    vector_database = faiss.IndexFlatIP(
-        dimension
-    )
-
-
-    vector_database.add(
-        embeddings
-    )
-
+    # Save into session state
+    st.session_state.documents = documents
+    st.session_state.chunks = chunks
+    st.session_state.vector_database = vector_database
 
     return (
         "✅ Knowledge base created!\n\n"
-        f"Documents: {len(documents)}\n"
+        f"Documents: {len(documents)}\n\n"
         f"Chunks: {len(chunks)}"
     )
 
@@ -275,134 +167,56 @@ def build_database(files):
 # RETRIEVE
 # ============================================================
 
-def retrieve(
-    question,
-    top_k=5
-):
+def retrieve(question, top_k=5):
+    vector_database = st.session_state.vector_database
+    chunks = st.session_state.chunks
 
     if vector_database is None:
-
         return []
-
 
     query_embedding = embedding_model.encode(
         [question],
         convert_to_numpy=True,
         normalize_embeddings=True
-    )
-
-
-    query_embedding = query_embedding.astype(
-        "float32"
-    )
-
+    ).astype("float32")
 
     scores, indexes = vector_database.search(
         query_embedding,
         min(top_k, len(chunks))
     )
 
-
     results = []
-
-
-    for score, index in zip(
-        scores[0],
-        indexes[0]
-    ):
-
+    for score, index in zip(scores[0], indexes[0]):
         if index >= 0:
-
             results.append({
-
-                "text":
-                    chunks[index]["text"],
-
-                "source":
-                    chunks[index]["source"],
-
-                "score":
-                    float(score)
-
+                "text": chunks[index]["text"],
+                "source": chunks[index]["source"],
+                "score": float(score)
             })
-
 
     return results
 
 
 # ============================================================
-# RAG CHATBOT
+# RAG CHAT (returns the answer string; history handled by caller)
 # ============================================================
 
-def rag_chat(
-    message,
-    history
-):
-
-    if not message.strip():
-
-        return history
-
-
-    # --------------------------------------------------------
-    # CHECK DATABASE
-    # --------------------------------------------------------
-
-    if vector_database is None:
-
-        answer = (
+def rag_chat(message):
+    if st.session_state.vector_database is None:
+        return (
             "⚠️ Please upload your documents "
             "and click 'Build Knowledge Base' first."
         )
 
-        history = history + [
-            {
-                "role": "user",
-                "content": message
-            },
-            {
-                "role": "assistant",
-                "content": answer
-            }
-        ]
-
-        return history
-
-
-    # --------------------------------------------------------
-    # RETRIEVE
-    # --------------------------------------------------------
-
-    results = retrieve(
-        message,
-        top_k=5
-    )
-
+    results = retrieve(message, top_k=5)
 
     if not results:
-
         context = "No relevant information found."
-
     else:
-
-        context_parts = []
-
-        for result in results:
-
-            context_parts.append(
-                f"[Source: {result['source']}]\n"
-                f"{result['text']}"
-            )
-
-
-        context = "\n\n".join(
-            context_parts
-        )
-
-
-    # --------------------------------------------------------
-    # PROMPT
-    # --------------------------------------------------------
+        context_parts = [
+            f"[Source: {r['source']}]\n{r['text']}" for r in results
+        ]
+        context = "\n\n".join(context_parts)
 
     prompt = f"""
 You are a RAG-based private AI assistant.
@@ -436,228 +250,84 @@ USER QUESTION:
 {message}
 """
 
-
-    # --------------------------------------------------------
-    # GROQ
-    # --------------------------------------------------------
-
     try:
-
         response = client.chat.completions.create(
-
             model=MODEL,
-
             messages=[
-                {
-                    "role": "system",
-                    "content":
-                    "You are a helpful RAG assistant."
-                },
-
-                {
-                    "role": "user",
-                    "content": prompt
-                }
+                {"role": "system", "content": "You are a helpful RAG assistant."},
+                {"role": "user", "content": prompt}
             ],
-
             temperature=0.2,
-
             max_tokens=4096
         )
-
-
         answer = response.choices[0].message.content
 
-
     except Exception as e:
-
-        answer = (
-            "❌ Groq error:\n\n"
-            + str(e)
-        )
-
-
-    # --------------------------------------------------------
-    # SOURCE INFORMATION
-    # --------------------------------------------------------
+        answer = "❌ Groq error:\n\n" + str(e)
 
     if results:
+        sources = list(dict.fromkeys(r["source"] for r in results))
+        answer += "\n\n---\n📚 Sources: " + ", ".join(sources)
 
-        sources = list(
-            dict.fromkeys(
-                r["source"]
-                for r in results
-            )
-        )
-
-        answer += (
-            "\n\n---\n"
-            "📚 Sources: "
-            + ", ".join(sources)
-        )
-
-
-    # --------------------------------------------------------
-    # HISTORY
-    # --------------------------------------------------------
-
-    history = history + [
-
-        {
-            "role":
-                "user",
-
-            "content":
-                message
-        },
-
-        {
-            "role":
-                "assistant",
-
-            "content":
-                answer
-        }
-
-    ]
-
-
-    return history
+    return answer
 
 
 # ============================================================
-# CLEAR CHAT
+# UI — SIDEBAR: UPLOAD + BUILD KNOWLEDGE BASE
 # ============================================================
 
-def clear_chat():
+st.title("🧠 MyAI — RAG Chatbot")
+st.caption("Ask questions about your own documents. **PDF • DOCX • TXT**")
 
-    return []
+with st.sidebar:
+    st.header("📂 Knowledge Base")
 
-
-# ============================================================
-# GUI
-# ============================================================
-
-with gr.Blocks(
-    title="MyAI RAG"
-) as demo:
-
-    gr.Markdown(
-        """
-# 🧠 MyAI — RAG Chatbot
-
-Ask questions about your own documents.
-
-**PDF • DOCX • TXT**
-"""
+    uploaded_files = st.file_uploader(
+        "Upload Knowledge Base",
+        type=["pdf", "docx", "txt"],
+        accept_multiple_files=True
     )
 
+    if st.button("🔨 Build Knowledge Base", type="primary"):
+        with st.spinner("Building knowledge base..."):
+            status_message = build_database(uploaded_files)
+        st.markdown(status_message)
 
-    # --------------------------------------------------------
-    # FILE UPLOAD
-    # --------------------------------------------------------
+    if st.session_state.documents:
+        st.success(f"Loaded: {', '.join(st.session_state.documents)}")
 
-    files = gr.File(
-        label="Upload Knowledge Base",
-        file_count="multiple",
-        file_types=[
-            ".pdf",
-            ".docx",
-            ".txt"
-        ]
-    )
-
-
-    build = gr.Button(
-        "🔨 Build Knowledge Base",
-        variant="primary"
-    )
-
-
-    status = gr.Markdown(
-        "Upload documents to begin."
-    )
-
-
-    build.click(
-        build_database,
-        inputs=files,
-        outputs=status
-    )
-
-
-    # --------------------------------------------------------
-    # CHAT
-    # --------------------------------------------------------
-
-    chatbot = gr.Chatbot(
-        label="MyAI",
-        height=500
-    )
-
-
-    message = gr.Textbox(
-        placeholder=
-        "Ask something about your documents...",
-        label="Question"
-    )
-
-
-    with gr.Row():
-
-        send = gr.Button(
-            "Send ➤",
-            variant="primary"
-        )
-
-        clear = gr.Button(
-            "🗑 Clear"
-        )
-
-
-    # --------------------------------------------------------
-    # SEND
-    # --------------------------------------------------------
-
-    send.click(
-        rag_chat,
-        inputs=[
-            message,
-            chatbot
-        ],
-        outputs=[
-            chatbot
-        ]
-    )
-
-
-    message.submit(
-        rag_chat,
-        inputs=[
-            message,
-            chatbot
-        ],
-        outputs=[
-            chatbot
-        ]
-    )
-
-
-    # --------------------------------------------------------
-    # CLEAR
-    # --------------------------------------------------------
-
-    clear.click(
-        clear_chat,
-        outputs=chatbot
-    )
+    if st.button("🗑 Clear Chat"):
+        st.session_state.chat_history = []
+        st.rerun()
 
 
 # ============================================================
-# START
+# UI — CHAT DISPLAY
 # ============================================================
 
-demo.launch(
-    share=True,
-    debug=True
-)
+for msg in st.session_state.chat_history:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+
+# ============================================================
+# UI — CHAT INPUT
+# ============================================================
+
+user_message = st.chat_input("Ask something about your documents...")
+
+if user_message:
+    st.session_state.chat_history.append(
+        {"role": "user", "content": user_message}
+    )
+    with st.chat_message("user"):
+        st.markdown(user_message)
+
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking..."):
+            answer = rag_chat(user_message)
+        st.markdown(answer)
+
+    st.session_state.chat_history.append(
+        {"role": "assistant", "content": answer}
+    )
