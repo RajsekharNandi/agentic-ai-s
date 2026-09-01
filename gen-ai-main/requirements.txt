@@ -1,0 +1,9 @@
+os
+numpy 
+faiss
+gradio 
+Groq
+getpass
+PdfReader
+Document
+SentenceTransformer
